@@ -49,6 +49,7 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider,
         const val KEY_METADATA_EXT = "metadata_extension"
         const val KEY_STREAM_EXT = "stream_extension"
         const val KEY_FIRST_AVAILABLE = "first_available"
+        const val KEY_INCLUDE_META_FALLBACK = "include_meta_fallback"
     }
 
     private lateinit var settings: Settings
@@ -78,6 +79,15 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider,
                 "First Available Mode",
                 KEY_FIRST_AVAILABLE,
                 "Return only streams from the highest priority extension that finds the track",
+                false
+            ),
+            SettingSwitch(
+                "Include Metadata Extension As Fallback Stream",
+                KEY_INCLUDE_META_FALLBACK,
+                "If disabled, the Metadata Extension (e.g. Spotify) is NOT added as an extra " +
+                    "stream source when it isn't explicitly picked. Keeping this off avoids " +
+                    "low-bitrate metadata previews (e.g. Spotify 30s previews) polluting the " +
+                    "quality list and breaking 'Medium' quality selection in the main app.",
                 false
             ),
             SettingList(
@@ -155,7 +165,8 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider,
             findExt(id)?.let { result.add(it) } ?: break
         }
 
-        if (result.none { it.id == metaExt.id }) {
+        val includeMetaFallback = settings.getBoolean(KEY_INCLUDE_META_FALLBACK) == true
+        if (includeMetaFallback && result.none { it.id == metaExt.id }) {
             result.add(metaExt)
         }
 
