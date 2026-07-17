@@ -33,17 +33,12 @@ jobs:
           echo "NAME_EXT=${{ env.NAME }} Extension" >> $GITHUB_ENV
           echo -e "## ${{ env.NAME }}\n${{ github.event.head_commit.message }}" > commit.txt
           echo "APP_PATH=app/build/${{ env.TAG }}-$version.eapk" >> $GITHUB_ENV
-          echo "${{ secrets.KEYSTORE_B64 }}" | base64 -d > "$GITHUB_WORKSPACE/signing-key.jks"
           chmod +x ./gradlew
 
       - name: Build with Gradle
         run: |
-          ./gradlew assembleDebug \
-          -Pandroid.injected.signing.store.file="$GITHUB_WORKSPACE/signing-key.jks" \
-          -Pandroid.injected.signing.store.password="${{ secrets.PASSWORD }}" \
-          -Pandroid.injected.signing.key.alias="key0" \
-          -Pandroid.injected.signing.key.password="${{ secrets.PASSWORD }}"
-          
+          ./gradlew assembleDebug
+
           mkdir -p app/build
           cp app/build/outputs/apk/debug/app-debug.apk ${{ env.APP_PATH }}
 
