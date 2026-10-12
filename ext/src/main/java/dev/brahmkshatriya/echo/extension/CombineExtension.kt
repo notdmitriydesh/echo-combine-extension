@@ -31,12 +31,15 @@ import dev.brahmkshatriya.echo.common.settings.Setting
 import dev.brahmkshatriya.echo.common.settings.SettingList
 import dev.brahmkshatriya.echo.common.settings.SettingSwitch
 import dev.brahmkshatriya.echo.common.settings.Settings
-import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlin.math.abs
 
 class CombineExtension : ExtensionClient, MusicExtensionsProvider,
     HomeFeedClient, SearchFeedClient, TrackClient,
@@ -49,6 +52,17 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider,
         const val KEY_METADATA_EXT = "metadata_extension"
         const val KEY_STREAM_EXT = "stream_extension"
         const val KEY_FIRST_AVAILABLE = "first_available"
+        const val KEY_FALLBACK_BEST_ONLY = "fallback_best_only"
+
+        // Track matching / lookup tuning
+        const val STREAM_LOOKUP_TIMEOUT_MS = 12_000L
+        // First Available Mode: backup extensions are only started if the preferred one
+        // fails/misses, or hasn't answered within this time (so a slow source can't stall playback).
+        const val FALLBACK_START_DELAY_MS = 4_000L
+        const val MATCH_CACHE_SIZE = 200
+        const val MATCH_TTL_MS = 30 * 60 * 1000L
+        const val MISS_TTL_MS = 5 * 60 * 1000L
+        const val MIN_MATCH_SCORE = 55
         const val KEY_INCLUDE_META_FALLBACK = "include_meta_fallback"
     }
 
@@ -78,8 +92,18 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider,
             SettingSwitch(
                 "First Available Mode",
                 KEY_FIRST_AVAILABLE,
-                "Return only streams from the highest priority extension that finds the track",
-                false
+                "Return only streams from the highest priority extension that finds the track. " +
+                    "Keeps the app's Highest/Medium/Lowest quality mapped to that extension's own " +
+                    "tiers (e.g. FLAC / 320 / 128) instead of a mix of all sources",
+                true
+            ),
+            SettingSwitch(
+                "Fallback Sources: Best Quality Only",
+                KEY_FALLBACK_BEST_ONLY,
+                "If the preferred extension can't find the track and a backup one is used " +
+                    "(e.g. YouTube), expose only its highest quality stream, " +
+                    "regardless of the app's Medium/Lowest quality setting",
+                true
             ),
             SettingSwitch(
                 "Include Metadata Extension As Fallback Stream",
@@ -225,10 +249,21 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider,
         val metaTrack = metaClient.loadTrack(track, isDownload)
 
         val streamExts = getStreamExtensions()
-        val isFirstAvailable = settings.getBoolean(KEY_FIRST_AVAILABLE) == true
+        val isFirstAvailable = settings.getBoolean(KEY_FIRST_AVAILABLE) != false
+        val fallbackBestOnly = settings.getBoolean(KEY_FALLBACK_BEST_ONLY) != false
 
         val allStreamables = if (isFirstAvailable) {
-            selectFirstFound(metaTrack, streamExts, metaExt) ?: metaTrack.streamables
+            val found = selectFirstFound(metaTrack, streamExts, metaExt)
+            if (found == null) {
+                metaTrack.streamables
+            } else {
+                val (index, list) = found
+                // index 0 = preferred extension: keep all its tiers (FLAC/320/128), so the app's
+                // Highest/Medium/Lowest map onto them. Any backup extension: best stream only.
+                if (index > 0 && fallbackBestOnly) {
+                    listOfNotNull(list.maxByOrNull { it.quality })
+                } else list
+            }
         } else {
             coroutineScope {
                 val deferreds = streamExts.mapIndexed { index, ext ->
@@ -247,25 +282,49 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider,
         return metaTrack.copy(streamables = allStreamables)
     }
 
-    @OptIn(ExperimentalCoroutinesApi::class)
+    private class Found(val list: List<Streamable>?)
+
+    /**
+     * Lazy, priority-ordered lookup: only the preferred extension is queried at first.
+     * The next one is started when the previous one found nothing / failed, or when it is
+     * still silent after [FALLBACK_START_DELAY_MS]. Returns (index in [exts], streamables).
+     */
     private suspend fun selectFirstFound(
         metaTrack: Track,
         exts: List<MusicExtension>,
         metaExt: MusicExtension
-    ): List<Streamable>? = coroutineScope {
-        val deferreds = exts.map { ext ->
-            if (ext.id == metaExt.id) {
-                async { metaTrack.streamables.ifEmpty { null } }
-            } else {
-                async { findTrackInStreamExtension(metaTrack, ext)?.streamables?.ifEmpty { null } }
+    ): Pair<Int, List<Streamable>>? = coroutineScope {
+        val deferreds = ArrayList<Deferred<Found>>()
+        var next = 0
+
+        fun launchNext() {
+            val ext = exts[next++]
+            deferreds += async {
+                if (ext.id == metaExt.id) {
+                    Found(metaTrack.streamables.ifEmpty { null })
+                } else {
+                    Found(tryOrNull { findTrackInStreamExtension(metaTrack, ext)?.streamables?.ifEmpty { null } })
+                }
             }
         }
 
-        for (deferred in deferreds) {
-            val res = deferred.await()
-            if (!res.isNullOrEmpty()) {
-                deferreds.forEach { it.cancel() }
-                return@coroutineScope res
+        if (exts.isNotEmpty()) launchNext()
+        var idx = 0
+        while (idx < deferreds.size) {
+            val d = deferreds[idx]
+            val canStartMore = next < exts.size
+            // null = still running after the delay (not "found nothing")
+            val res = if (canStartMore) withTimeoutOrNull(FALLBACK_START_DELAY_MS) { d.await() } else d.await()
+            when {
+                res == null -> launchNext()
+                res.list != null -> {
+                    deferreds.forEach { it.cancel() }
+                    return@coroutineScope idx to res.list
+                }
+                else -> {
+                    idx++
+                    if (idx == deferreds.size && next < exts.size) launchNext()
+                }
             }
         }
         null
@@ -280,55 +339,176 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider,
 
     override suspend fun loadFeed(track: Track): Feed<Shelf>? = getMetadataExtension().client<TrackClient>().loadFeed(track)
 
+    // --- Track matching: metadata track -> best matching track in a stream extension ---
+
+    private class Lookup(val track: Track?, val cacheable: Boolean)
+    private class CacheEntry(val track: Track?, val expiresAt: Long)
+
+    private val matchCache = object : LinkedHashMap<String, CacheEntry>(64, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, CacheEntry>?): Boolean =
+            size > MATCH_CACHE_SIZE
+    }
+
+    // Like runCatching().getOrNull(), but never swallows coroutine cancellation (needed for timeouts).
+    private inline fun <T> tryOrNull(block: () -> T): T? = try {
+        block()
+    } catch (e: CancellationException) {
+        throw e
+    } catch (_: Exception) {
+        null
+    }
+
     private suspend fun findTrackInStreamExtension(metaTrack: Track, streamExt: MusicExtension): Track? {
-        val searchClient = try { streamExt.client<SearchFeedClient>() } catch (_: Exception) { return null }
-        val trackClient = try { streamExt.client<TrackClient>() } catch (_: Exception) { return null }
+        val key = "${metaTrack.id}|${streamExt.id}"
+        val cached = synchronized(matchCache) {
+            val hit = matchCache[key]
+            if (hit != null && hit.expiresAt <= System.currentTimeMillis()) {
+                matchCache.remove(key)
+                null
+            } else hit
+        }
+        if (cached != null) return cached.track
+
+        // Timeout (null) is never cached, so a slow/hanging extension is retried next time.
+        val lookup = withTimeoutOrNull(STREAM_LOOKUP_TIMEOUT_MS) {
+            searchStreamTrack(metaTrack, streamExt)
+        } ?: return null
+
+        if (lookup.cacheable) {
+            val ttl = if (lookup.track != null) MATCH_TTL_MS else MISS_TTL_MS
+            synchronized(matchCache) {
+                matchCache[key] = CacheEntry(lookup.track, System.currentTimeMillis() + ttl)
+            }
+        }
+        return lookup.track
+    }
+
+    private suspend fun searchStreamTrack(metaTrack: Track, streamExt: MusicExtension): Lookup {
+        val searchClient = tryOrNull { streamExt.client<SearchFeedClient>() } ?: return Lookup(null, false)
+        val trackClient = tryOrNull { streamExt.client<TrackClient>() } ?: return Lookup(null, false)
 
         val artistName = metaTrack.artists.firstOrNull()?.name ?: ""
         val query = "${metaTrack.title} $artistName".trim()
-        if (query.isEmpty()) return null
+        if (query.isEmpty()) return Lookup(null, true)
 
-        val feed = try { searchClient.loadSearchFeed(query) } catch (_: Exception) { return null }
-        
-        val shelves = loadFirstPage(feed.getPagedData(feed.tabs.firstOrNull()).pagedData)
-        val artistNameLower = artistName.lowercase()
-        val trackTitleLower = metaTrack.title.lowercase()
+        val feed = tryOrNull { searchClient.loadSearchFeed(query) } ?: return Lookup(null, false)
+        val shelves = tryOrNull {
+            feed.getPagedData(feed.tabs.firstOrNull()).pagedData.loadPage(null).data
+        } ?: return Lookup(null, false)
 
-        for (shelf in shelves) {
-            val candidate = findTrackInShelf(shelf, artistNameLower, trackTitleLower)
-            if (candidate != null) {
-                val loaded = try { trackClient.loadTrack(candidate, false) } catch (_: Exception) { null }
-                if (loaded != null && loaded.streamables.isNotEmpty()) {
-                    return loaded.copy(streamables = loaded.streamables.map { s ->
+        val candidates = shelves.flatMap { tracksIn(it) }
+            .map { it to scoreMatch(metaTrack, it) }
+            .filter { it.second >= MIN_MATCH_SCORE }
+            .sortedByDescending { it.second }
+            .distinctBy { it.first.id }
+            .take(3)
+
+        var cacheable = true
+        for ((candidate, _) in candidates) {
+            val loaded = tryOrNull { trackClient.loadTrack(candidate, false) }
+            if (loaded == null) {
+                cacheable = false
+                continue
+            }
+            if (loaded.streamables.isNotEmpty()) {
+                return Lookup(
+                    loaded.copy(streamables = loaded.streamables.map { s ->
                         s.copy(extras = s.extras + mapOf("stream_ext_id" to streamExt.id))
-                    })
-                }
+                    }),
+                    true
+                )
             }
         }
-        return null
+        return Lookup(null, cacheable)
     }
 
-    private fun findTrackInShelf(shelf: Shelf, artistNameLower: String, trackTitleLower: String): Track? {
-        return when (shelf) {
-            is Shelf.Item -> {
-                val media = shelf.media
-                if (media is Track && matches(media, artistNameLower, trackTitleLower)) media else null
-            }
-            is Shelf.Lists.Tracks -> shelf.list.firstOrNull { matches(it, artistNameLower, trackTitleLower) }
-            is Shelf.Lists.Items -> shelf.list.mapNotNull { item -> item as? Track }.firstOrNull { matches(it, artistNameLower, trackTitleLower) }
-            else -> null
+    private fun tracksIn(shelf: Shelf): List<Track> = when (shelf) {
+        is Shelf.Item -> listOfNotNull(shelf.media as? Track)
+        is Shelf.Lists.Tracks -> shelf.list
+        is Shelf.Lists.Items -> shelf.list.filterIsInstance<Track>()
+        else -> emptyList()
+    }
+
+    private val parenRegex = Regex("[\\(\\[\\{][^\\)\\]\\}]*[\\)\\]\\}]")
+    private val dashSuffixRegex = Regex("\\s[-\u2013\u2014]\\s.*$")
+    private val featRegex = Regex("\\b(feat|ft|featuring)\\b\\.?.*$")
+    private val nonWordRegex = Regex("[^\\p{L}\\p{N}\\s]")
+    private val spacesRegex = Regex("\\s+")
+    private val versionTags = listOf(
+        "live", "remix", "acoustic", "instrumental", "karaoke", "cover",
+        "slowed", "sped up", "reverb", "nightcore", "mashup", "demo"
+    )
+
+    private fun normalize(s: String): String =
+        s.lowercase().replace(nonWordRegex, " ").replace(spacesRegex, " ").trim()
+
+    // "Song (feat. X) - Remastered 2011" -> "song"
+    private fun baseTitle(s: String): String {
+        val stripped = s.lowercase()
+            .replace(parenRegex, " ")
+            .replace(dashSuffixRegex, " ")
+            .replace(featRegex, " ")
+        return normalize(stripped).ifEmpty { normalize(s) }
+    }
+
+    private fun versionTagsOf(title: String): Set<String> {
+        val n = " ${normalize(title)} "
+        return versionTags.filter { n.contains(" $it ") }.toSet()
+    }
+
+    /**
+     * How well [cand] (a search result from a stream extension) matches [meta].
+     * ISRC match wins outright; otherwise title + artist + duration + version tags (live/remix/...).
+     * Returns a score; >= MIN_MATCH_SCORE counts as a match.
+     */
+    private fun scoreMatch(meta: Track, cand: Track): Int {
+        val metaIsrc = meta.isrc
+        val candIsrc = cand.isrc
+        if (!metaIsrc.isNullOrBlank() && metaIsrc.equals(candIsrc, ignoreCase = true)) return 1000
+
+        val mt = baseTitle(meta.title)
+        val ct = baseTitle(cand.title)
+        if (mt.isEmpty() || ct.isEmpty()) return 0
+
+        var score = when {
+            mt == ct -> 60
+            (mt.length >= 4 && ct.contains(mt)) || (ct.length >= 4 && mt.contains(ct)) -> 30
+            else -> return 0
         }
-    }
 
-    private fun matches(track: Track, artistNameLower: String, trackTitleLower: String): Boolean {
-        val titleMatch = track.title.lowercase().contains(trackTitleLower) || trackTitleLower.contains(track.title.lowercase())
-        if (!titleMatch) return false
-        if (artistNameLower.isEmpty()) return true
-        return track.artists.any { it.name.lowercase().contains(artistNameLower) } ||
-               artistNameLower.split(" ").any { part -> part.length > 2 && track.artists.any { it.name.lowercase().contains(part) } }
-    }
+        val metaArtists = meta.artists.map { normalize(it.name) }.filter { it.isNotEmpty() }
+        val candArtists = cand.artists.map { normalize(it.name) }.filter { it.isNotEmpty() }
+        if (metaArtists.isNotEmpty() && candArtists.isNotEmpty()) {
+            val full = metaArtists.any { m -> candArtists.any { c -> c == m || c.contains(m) || m.contains(c) } }
+            val partial = metaArtists.any { m ->
+                m.split(" ").any { part -> part.length > 2 && candArtists.any { c -> c.contains(part) } }
+            }
+            score += when {
+                full -> 30
+                partial -> 15
+                else -> -40
+            }
+        }
 
-    private suspend fun <T : Any> loadFirstPage(pagedData: PagedData<T>): List<T> = try { pagedData.loadPage(null).data } catch (_: Exception) { emptyList() }
+        val md = meta.duration
+        val cd = cand.duration
+        if (md != null && cd != null && md > 0 && cd > 0) {
+            val diff = abs(md - cd)
+            score += when {
+                diff <= 3_000 -> 25
+                diff <= 8_000 -> 10
+                diff <= 15_000 -> -10
+                else -> -50
+            }
+        }
+
+        val metaTags = versionTagsOf(meta.title)
+        val candTags = versionTagsOf(cand.title)
+        score -= 40 * (candTags - metaTags).size
+        score -= 30 * (metaTags - candTags).size
+
+        return score
+    }
 
     override suspend fun loadAlbum(album: Album): Album = getMetadataExtension().client<AlbumClient>().loadAlbum(album)
     override suspend fun loadTracks(album: Album): Feed<Track>? = getMetadataExtension().client<AlbumClient>().loadTracks(album)
