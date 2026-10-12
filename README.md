@@ -1,4 +1,4 @@
-# Echo Combine Extension — Desh Fork
+# Echo Combine Extension
 
 An enhanced fork of [Echo Combine Extension](https://github.com/dutixlf/echo-combine-extension) for [Echo](https://github.com/brahmkshatriya/echo).
 
